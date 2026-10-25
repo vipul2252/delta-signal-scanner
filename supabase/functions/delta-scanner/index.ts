@@ -272,7 +272,9 @@ async function tg(text: string) {
   }
 }
 
-function alertBlock(cur: Ticker, sigs: Sig[], trade?: PaperTrade | null) {
+const VARIANT_NAME: Record<string, string> = { A: "Signal disha", B: "Ulta", C: "BTC trend disha" };
+
+function alertBlock(cur: Ticker, sigs: Sig[], trades: PaperTrade[] = []) {
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
   const head = bias < 0 ? "🔻 Neeche ka risk" : bias > 0 ? "🔺 Upar ka risk" : "⚖️ Mixed";
   const link = `https://www.delta.exchange/app/futures/trade/${cur.underlying}/${cur.symbol}`;
@@ -281,9 +283,10 @@ function alertBlock(cur: Ticker, sigs: Sig[], trade?: PaperTrade | null) {
     `Price $${fmtPrice(cur.mark_price)} (${sign(cur.change_24h)}% 24h) · OI ${fmtUsd(cur.oi_usd)} · Vol ${fmtUsd(cur.volume_usd)}`,
     ...sigs.map((s) => `• <i>${s.name}:</i> ${s.text}`),
   ];
-  if (trade) {
-    lines.push(`📘 <i>Paper trade (track ho raha hai):</i> ${trade.side.toUpperCase()} @ $${fmtPrice(trade.entry)} · ` +
-      `SL $${fmtPrice(trade.sl)} (−${trade.sl_pct.toFixed(1)}%) · TP $${fmtPrice(trade.tp)} (+${(trade.sl_pct * CFG.RR).toFixed(1)}%)`);
+  if (trades.length) {
+    const t0 = trades[0];
+    lines.push(`📘 <i>Paper trades @ $${fmtPrice(t0.entry)} · SL ${t0.sl_pct.toFixed(1)}% · TP ${(t0.sl_pct * CFG.RR).toFixed(1)}%:</i> ` +
+      trades.map((t) => `${t.variant} ${t.side.toUpperCase()}`).join(" · "));
   }
   return lines.join("\n");
 }
@@ -291,7 +294,7 @@ function alertBlock(cur: Ticker, sigs: Sig[], trade?: PaperTrade | null) {
 // ---------------------------------------------------------------- paper-trade tracker (1:RR)
 type PaperTrade = {
   symbol: string; side: "long" | "short"; entry: number; sl: number; tp: number; sl_pct: number;
-  score: number; combo: string; btc_trend: string | null;
+  score: number; combo: string; btc_trend: string | null; variant: string;
 };
 type OpenTrade = PaperTrade & { id: number; opened_at: string; max_fav_pct: number; max_adv_pct: number };
 
@@ -326,23 +329,36 @@ async function btcTrend() {
   return (BTC_TREND_CACHE = c[c.length - 1].close > sma ? "up" : "down");
 }
 
-async function openTrade(cur: Ticker, sigs: Sig[]): Promise<PaperTrade | null> {
+// Ek alert par 3 paper trades: A = signal ki disha, B = ulta, C = BTC 7-din trend ki disha
+async function openTrades(cur: Ticker, sigs: Sig[], openKeys: Set<string>): Promise<PaperTrade[]> {
+  if (cur.mark_price <= 0) return [];
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
-  if (bias === 0 || cur.mark_price <= 0) return null;
-  const side = bias > 0 ? "long" : "short";
+  const trend = await btcTrend();
+  const sides: [string, "long" | "short" | null][] = [
+    ["A", bias > 0 ? "long" : bias < 0 ? "short" : null],
+    ["B", bias > 0 ? "short" : bias < 0 ? "long" : null],
+    ["C", trend === "up" ? "long" : trend === "down" ? "short" : null],
+  ];
+  const todo = sides.filter(([v, side]) => side && !openKeys.has(`${cur.symbol}|${v}`));
+  if (!todo.length) return [];
   const slp = await atrPct(cur.symbol, cur.mark_price);
-  const dir = side === "long" ? 1 : -1;
-  const t: PaperTrade = {
-    symbol: cur.symbol, side, entry: cur.mark_price,
-    sl: cur.mark_price * (1 - dir * slp / 100),
-    tp: cur.mark_price * (1 + dir * CFG.RR * slp / 100),
-    sl_pct: Math.round(slp * 100) / 100,
-    score: sigs.length,
-    combo: sigs.map((s) => s.name).sort().join("+"),
-    btc_trend: await btcTrend(),
-  };
-  await sb("delta_trades", { method: "POST", body: JSON.stringify(t), prefer: "return=minimal" });
-  return t;
+  const out: PaperTrade[] = [];
+  for (const [variant, side] of todo) {
+    const dir = side === "long" ? 1 : -1;
+    out.push({
+      symbol: cur.symbol, side: side!, entry: cur.mark_price,
+      sl: cur.mark_price * (1 - dir * slp / 100),
+      tp: cur.mark_price * (1 + dir * CFG.RR * slp / 100),
+      sl_pct: Math.round(slp * 100) / 100,
+      score: sigs.length,
+      combo: sigs.map((s) => s.name).sort().join("+"),
+      btc_trend: trend,
+      variant,
+    });
+    openKeys.add(`${cur.symbol}|${variant}`);
+  }
+  await sb("delta_trades", { method: "POST", body: JSON.stringify(out), prefer: "return=minimal" });
+  return out;
 }
 
 async function updateTrades(now: Date) {
@@ -364,7 +380,7 @@ async function updateTrades(now: Date) {
       const r = (dir * pct(t.entry, exit) - CFG.FEE_PCT) / t.sl_pct;
       Object.assign(patch, { status, closed_at: now.toISOString(), exit_price: exit, r: Math.round(r * 100) / 100 });
       const icon = status === "tp" ? "✅" : status === "sl" ? "❌" : "⏱";
-      closedMsgs.push(`${icon} ${esc(t.symbol)} ${t.side.toUpperCase()} ${status.toUpperCase()} · ${r >= 0 ? "+" : ""}${r.toFixed(2)}R ` +
+      closedMsgs.push(`${icon} [${t.variant ?? "A"}] ${esc(t.symbol)} ${t.side.toUpperCase()} ${status.toUpperCase()} · ${r >= 0 ? "+" : ""}${r.toFixed(2)}R ` +
         `($${fmtPrice(t.entry)} → $${fmtPrice(exit)}, ${ageH.toFixed(1)}h)`);
     } else if (fav === num(t.max_fav_pct) && adv === num(t.max_adv_pct)) {
       continue; // kuch nahi badla
@@ -385,26 +401,28 @@ function rStats(rows: { r: number }[]) {
 
 async function weeklyReport(now: Date) {
   const since = new Date(now.getTime() - 7 * 86_400_000).toISOString();
-  type Closed = { r: number; combo: string; side: string; btc_trend: string | null; status: string };
-  const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=r,combo,side,btc_trend,status`) ?? [];
-  const all: Closed[] = await sb(`delta_trades?status=neq.open&select=r,combo,side,btc_trend,status`) ?? [];
+  type Closed = { r: number; combo: string; side: string; btc_trend: string | null; status: string; variant: string | null };
+  const cols = "r,combo,side,btc_trend,status,variant";
+  const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=${cols}`) ?? [];
+  const all: Closed[] = await sb(`delta_trades?status=neq.open&select=${cols}`) ?? [];
   const openN = (await sb("delta_trades?status=eq.open&select=id") ?? []).length;
-  const group = (rows: Closed[], key: keyof Closed) => {
-    const g = new Map<string, Closed[]>();
-    for (const x of rows) { const k = String(x[key] ?? "?"); g.set(k, [...(g.get(k) ?? []), x]); }
-    return [...g.entries()].sort((a, b) => b[1].length - a[1].length).map(([k, v]) => `  ${esc(k)}: ${rStats(v)}`).join("\n");
-  };
+  const byVariant = (rows: Closed[]) => ["A", "B", "C"].map((v) => {
+    const sub = rows.filter((x) => (x.variant ?? "A") === v);
+    const sides = ["long", "short"].map((sd) => {
+      const ss = sub.filter((x) => x.side === sd);
+      return ss.length ? `     ${sd}: ${rStats(ss)}` : "";
+    }).filter(Boolean).join("\n");
+    return `<b>${v} · ${VARIANT_NAME[v]}</b>: ${rStats(sub)}` + (sides ? `\n${sides}` : "");
+  }).join("\n");
   const be = (100 / (CFG.RR + 1)).toFixed(0);
   await tg([
     `📊 <b>Weekly Signal Report</b> · ${istDay(now)}`,
-    `<i>Har alert = paper trade, SL ${CFG.ATR_MULT}×ATR, TP ${CFG.RR}× SL, fees ${CFG.FEE_PCT}%. 1:${CFG.RR} me break-even ~${be}% win.</i>`,
-    `<b>Pichhle 7 din:</b> ${rStats(week)}`,
-    week.length ? `<b>Signal combo:</b>\n${group(week, "combo")}` : "",
-    week.length ? `<b>Long/Short:</b>\n${group(week, "side")}` : "",
-    week.length ? `<b>BTC trend ke saath:</b>\n${group(week, "btc_trend")}` : "",
-    `<b>Shuru se ab tak:</b> ${rStats(all)}`,
+    `<i>Har alert par 3 paper trades: A = signal ki disha, B = ulta, C = BTC 7-din trend ki disha. ` +
+      `SL ${CFG.ATR_MULT}×ATR, TP ${CFG.RR}× SL, fees ${CFG.FEE_PCT}%. Break-even ~${be}% win.</i>`,
+    `🗓 <b>Pichhle 7 din</b>\n${byVariant(week)}`,
+    `📈 <b>Shuru se ab tak</b>\n${byVariant(all)}`,
     `Abhi khule paper trades: ${openN}`,
-  ].filter(Boolean).join("\n\n"));
+  ].join("\n\n"));
 }
 
 // ---------------------------------------------------------------- main
@@ -446,8 +464,9 @@ async function runScan(now: Date) {
   BTC_TREND_CACHE = undefined; // har run me taaza
   // Pehle khule paper trades update (SL/TP/timeout)
   const tradeRes = await updateTrades(now);
-  const openSyms = new Set<string>(
-    ((await sb("delta_trades?status=eq.open&select=symbol")) ?? []).map((x: { symbol: string }) => x.symbol),
+  const openKeys = new Set<string>(
+    ((await sb("delta_trades?status=eq.open&select=symbol,variant")) ?? [])
+      .map((x: { symbol: string; variant: string | null }) => `${x.symbol}|${x.variant ?? "A"}`),
   );
 
   const blocks: { score: number; vol: number; text: string }[] = [];
@@ -460,12 +479,10 @@ async function runScan(now: Date) {
     if (sigs.length < CFG.MIN_SCORE) continue;
     const p = prev.get(cur.symbol);
     if (p && (now.getTime() - p.ts) / 3_600_000 < CFG.COOLDOWN_H && sigs.length <= p.score) continue;
-    let trade: PaperTrade | null = null;
-    if (!openSyms.has(cur.symbol)) {
-      try { trade = await openTrade(cur, sigs); if (trade) { opened++; openSyms.add(cur.symbol); } }
-      catch (e) { console.error("openTrade", cur.symbol, e); }
-    }
-    blocks.push({ score: sigs.length, vol: cur.volume_usd, text: alertBlock(cur, sigs, trade) });
+    let trades: PaperTrade[] = [];
+    try { trades = await openTrades(cur, sigs, openKeys); opened += trades.length; }
+    catch (e) { console.error("openTrades", cur.symbol, e); }
+    blocks.push({ score: sigs.length, vol: cur.volume_usd, text: alertBlock(cur, sigs, trades) });
     sent.push({ symbol: cur.symbol, last_ts: now.toISOString(), last_score: sigs.length });
   }
   if (blocks.length) {
