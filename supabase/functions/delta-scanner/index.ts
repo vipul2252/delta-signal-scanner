@@ -43,6 +43,11 @@ const CFG = {
   FEE_PCT: envNum("FEE_PCT", 0.1),           // round-trip fees %
   WEEKLY_DOW_IST: envNum("WEEKLY_DOW_IST", 0),   // 0 = Sunday
   WEEKLY_HOUR_IST: envNum("WEEKLY_HOUR_IST", 20),
+  // EMA strategy (purane funding/OI signals ki jagah)
+  SIGNAL_MODE: Deno.env.get("SIGNAL_MODE") ?? "ema",   // "ema" ya "legacy"
+  EMA_LEN: envNum("EMA_LEN", 200),
+  EMA_TF_H: envNum("EMA_TF_H", 4),            // 4 ghante ki candles
+  EMA_HOLD_H: envNum("EMA_HOLD_H", 168),      // 7 din me SL/TP na lage to band
   EXCLUDE: new Set((Deno.env.get("EXCLUDE_SYMBOLS") ?? "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)),
 };
 const LEVERAGES = [10, 20, 25, 50];
@@ -272,7 +277,7 @@ async function tg(text: string) {
   }
 }
 
-const VARIANT_NAME: Record<string, string> = { A: "Signal disha", B: "Ulta", C: "BTC trend disha" };
+const VARIANT_NAME: Record<string, string> = { A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
 
 function alertBlock(cur: Ticker, sigs: Sig[], trades: PaperTrade[] = []) {
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
@@ -374,7 +379,7 @@ async function updateTrades(now: Date) {
     let status: string | null = null, exit = price;
     if (dir > 0 ? price <= t.sl : price >= t.sl) { status = "sl"; exit = t.sl; }
     else if (dir > 0 ? price >= t.tp : price <= t.tp) { status = "tp"; exit = t.tp; }
-    else if (ageH >= CFG.HOLD_H) status = "timeout";
+    else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : CFG.HOLD_H)) status = "timeout";
     const patch: Record<string, unknown> = { max_fav_pct: fav, max_adv_pct: adv };
     if (status) {
       const r = (dir * pct(t.entry, exit) - CFG.FEE_PCT) / t.sl_pct;
@@ -406,7 +411,7 @@ async function weeklyReport(now: Date) {
   const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=${cols}`) ?? [];
   const all: Closed[] = await sb(`delta_trades?status=neq.open&select=${cols}`) ?? [];
   const openN = (await sb("delta_trades?status=eq.open&select=id") ?? []).length;
-  const byVariant = (rows: Closed[]) => ["A", "B", "C"].map((v) => {
+  const byVariant = (rows: Closed[]) => ["E", "A", "B", "C"].filter((v) => v === "E" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
     const sub = rows.filter((x) => (x.variant ?? "A") === v);
     const sides = ["long", "short"].map((sd) => {
       const ss = sub.filter((x) => x.side === sd);
@@ -417,7 +422,7 @@ async function weeklyReport(now: Date) {
   const be = (100 / (CFG.RR + 1)).toFixed(0);
   await tg([
     `📊 <b>Weekly Signal Report</b> · ${istDay(now)}`,
-    `<i>Har alert par 3 paper trades: A = signal ki disha, B = ulta, C = BTC 7-din trend ki disha. ` +
+    `<i>E = EMA${CFG.EMA_LEN} cross (${CFG.EMA_TF_H}h) paper trades. A/B/C = purane signals (band ho chuke, sirf purana hisaab). ` +
       `SL ${CFG.ATR_MULT}×ATR, TP ${CFG.RR}× SL, fees ${CFG.FEE_PCT}%. Break-even ~${be}% win.</i>`,
     `🗓 <b>Pichhle 7 din</b>\n${byVariant(week)}`,
     `📈 <b>Shuru se ab tak</b>\n${byVariant(all)}`,
@@ -452,6 +457,114 @@ async function maybeSave(now: Date, tickers: Ticker[]) {
   }));
   await sb("delta_snapshots", { method: "POST", body: JSON.stringify(rows), prefer: "return=minimal" });
   return true;
+}
+
+// ---------------------------------------------------------------- EMA200 cross strategy
+type Candle = { time: number; open: number; high: number; low: number; close: number };
+async function tfCandles(symbol: string, tfH: number, bars: number): Promise<Candle[]> {
+  const res = tfH >= 4 ? "4h" : "1h";
+  const step = res === "4h" ? 4 : 1;
+  const end = Math.floor(Date.now() / 1000), start = end - bars * step * 3600;
+  const r = await fetch(`https://api.india.delta.exchange/v2/history/candles?resolution=${res}&symbol=${
+    encodeURIComponent("MARK:" + symbol)}&start=${start}&end=${end}`);
+  if (!r.ok) return [];
+  const j = await r.json();
+  const nowS = Date.now() / 1000;
+  return ((j.result ?? []) as Candle[])
+    .filter((c) => c.time + step * 3600 <= nowS + 5)        // sirf band (closed) candles
+    .sort((a, b) => a.time - b.time);
+}
+
+function emaCross(c: Candle[], len: number) {
+  if (c.length < len + 5) return null;
+  const k = 2 / (len + 1);
+  let e = c[0].close;
+  const ema: number[] = [e];
+  for (let i = 1; i < c.length; i++) { e = c[i].close * k + e * (1 - k); ema.push(e); }
+  const n = c.length - 1;
+  const up = c[n - 1].close <= ema[n - 1] && c[n].close > ema[n];
+  const down = c[n - 1].close >= ema[n - 1] && c[n].close < ema[n];
+  // ATR(14) isi timeframe par
+  let tr = 0;
+  for (let i = n - 13; i <= n; i++) {
+    tr += Math.max(c[i].high - c[i].low, Math.abs(c[i].high - c[i - 1].close), Math.abs(c[i].low - c[i - 1].close));
+  }
+  return { side: up ? "long" as const : down ? "short" as const : null, ema: ema[n], close: c[n].close, candleTime: c[n].time, atr: tr / 14 };
+}
+
+async function runEmaScan(now: Date) {
+  const tickers = await fetchTickers();
+  const tradeRes = await updateTrades(now);
+  const tfS = CFG.EMA_TF_H * 3600;
+  const candleStart = Math.floor(now.getTime() / 1000 / tfS) * tfS;      // abhi wali candle ka start
+  const lastDone = await getState("__EMA__");
+  const mins = (now.getTime() / 1000 - candleStart) / 60;
+  // Har nayi candle band hone ke baad pehle 15 minute me ek baar check
+  if (mins > 15 || (lastDone && lastDone.getTime() / 1000 >= candleStart)) {
+    return { mode: "ema", coins: tickers.length, checked: false, trades_open: tradeRes.open, trades_closed: tradeRes.closed };
+  }
+  await upsertAlerts([{ symbol: "__EMA__", last_ts: now.toISOString(), last_score: 0 }]);
+
+  const openKeys = new Set<string>(
+    ((await sb("delta_trades?status=eq.open&variant=eq.E&select=symbol")) ?? []).map((x: { symbol: string }) => x.symbol),
+  );
+  const bars = CFG.EMA_LEN * 3 + 20;
+  const blocks: string[] = [];
+  const newTrades: PaperTrade[] = [];
+  for (let i = 0; i < tickers.length; i += 12) {
+    const batch = tickers.slice(i, i + 12);
+    const res = await Promise.all(batch.map(async (cur) => {
+      try { return { cur, x: emaCross(await tfCandles(cur.symbol, CFG.EMA_TF_H, bars), CFG.EMA_LEN) }; }
+      catch { return { cur, x: null }; }
+    }));
+    for (const { cur, x } of res) {
+      if (!x || !x.side) continue;
+      if (x.candleTime + tfS < candleStart) continue;              // purani candle ka cross nahi
+      const price = cur.mark_price || x.close;
+      const slp = Math.min(CFG.SL_MAX_PCT, Math.max(CFG.SL_MIN_PCT, (CFG.ATR_MULT * x.atr / price) * 100));
+      const dir = x.side === "long" ? 1 : -1;
+      let trade: PaperTrade | null = null;
+      if (!openKeys.has(cur.symbol)) {
+        trade = {
+          symbol: cur.symbol, side: x.side, entry: price,
+          sl: price * (1 - dir * slp / 100), tp: price * (1 + dir * CFG.RR * slp / 100),
+          sl_pct: Math.round(slp * 100) / 100, score: 1, combo: `EMA${CFG.EMA_LEN}-${CFG.EMA_TF_H}h`,
+          btc_trend: null, variant: "E",
+        };
+        newTrades.push(trade);
+        openKeys.add(cur.symbol);
+      }
+      const link = `https://www.delta.exchange/app/futures/trade/${cur.underlying}/${cur.symbol}`;
+      blocks.push([
+        `${x.side === "long" ? "🟢 BUY" : "🔴 SELL"} <b><a href="${link}">${esc(cur.symbol)}</a></b> — ${CFG.EMA_TF_H}h candle EMA${CFG.EMA_LEN} ke ` +
+          `${x.side === "long" ? "upar" : "neeche"} band hui`,
+        `Close $${fmtPrice(x.close)} · EMA $${fmtPrice(x.ema)} · Vol ${fmtUsd(cur.volume_usd)}`,
+        trade
+          ? `📘 Paper trade: ${trade.side.toUpperCase()} @ $${fmtPrice(trade.entry)} · SL $${fmtPrice(trade.sl)} (${trade.sl_pct.toFixed(1)}%) · TP $${fmtPrice(trade.tp)} (${(trade.sl_pct * CFG.RR).toFixed(1)}%)`
+          : `📘 Is coin par pehle se ek paper trade khula hai`,
+      ].join("\n"));
+    }
+  }
+  if (newTrades.length) await sb("delta_trades", { method: "POST", body: JSON.stringify(newTrades), prefer: "return=minimal" });
+  if (blocks.length) {
+    await tg(`📡 <b>EMA${CFG.EMA_LEN} Signals (${CFG.EMA_TF_H}h)</b> · ${istStr(now)}\n\n` + blocks.join("\n\n") +
+      "\n\n<i>Backtest me is strategy ka koi pakka faayda nahi dikha. Sirf jaankari — trade ka faisla aapka, stop-loss zaroor.</i>");
+  }
+  return { mode: "ema", coins: tickers.length, checked: true, signals: blocks.length, trades_opened: newTrades.length,
+    trades_open: tradeRes.open, trades_closed: tradeRes.closed };
+}
+
+async function runEmaSummary(now: Date) {
+  const since = new Date(now.getTime() - 86_400_000).toISOString();
+  type Row = { symbol: string; side: string; entry: number; opened_at: string };
+  const recent: Row[] = await sb(`delta_trades?variant=eq.E&opened_at=gte.${since}&select=symbol,side,entry,opened_at&order=opened_at.asc`) ?? [];
+  const openN = (await sb("delta_trades?status=eq.open&variant=eq.E&select=id") ?? []).length;
+  const lines = recent.map((r) => `${r.side === "long" ? "🟢" : "🔴"} ${esc(r.symbol)} ${r.side.toUpperCase()} @ $${fmtPrice(r.entry)} · ${istStr(new Date(r.opened_at))}`);
+  await tg([
+    `🗞 <b>Daily EMA${CFG.EMA_LEN} Summary</b> · ${istDay(now)}`,
+    `<b>Pichhle 24 ghante ke crosses:</b>\n` + (lines.join("\n") || "— koi cross nahi"),
+    `Khule EMA paper trades: ${openN}`,
+  ].join("\n\n"));
 }
 
 async function runScan(now: Date) {
@@ -608,14 +721,15 @@ Deno.serve(async (req) => {
       await tg("✅ Delta scanner (Supabase, har 1 minute) connected! Alerts yahan aayenge.");
       return Response.json({ ok: true, mode });
     }
-    const result: Record<string, unknown> = await runScan(now);
+    const emaMode = CFG.SIGNAL_MODE === "ema";
+    const result: Record<string, unknown> = emaMode ? await runEmaScan(now) : await runScan(now);
 
     // Roz ek baar summary (8 AM IST ke baad pehla run)
     const ist = istDate(now);
     if (mode === "summary" || ist.getUTCHours() >= CFG.SUMMARY_HOUR_IST) {
       const lastSum = await getState("__SUMMARY__");
       if (mode === "summary" || !lastSum || istDay(lastSum) !== istDay(now)) {
-        await runSummary(now);
+        if (emaMode) await runEmaSummary(now); else await runSummary(now);
         await upsertAlerts([{ symbol: "__SUMMARY__", last_ts: now.toISOString(), last_score: 0 }]);
         result.summary = true;
       }
