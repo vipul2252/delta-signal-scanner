@@ -358,11 +358,77 @@ async function runSummary(now: Date) {
     { method: "DELETE", prefer: "return=minimal" });
 }
 
+// ---------------------------------------------------------------- unlock auto-refresh (DefiLlama)
+const UNLOCK_SKIP = new Set(["GRAM"]); // naam takrata hai (DefiLlama ka TON), isliye skip
+async function refreshUnlocks(now: Date) {
+  const [deltaRes, pageRes] = await Promise.all([
+    fetch(CFG.DELTA_URL, { headers: { "User-Agent": "delta-signal-scanner" } }),
+    fetch("https://defillama.com/unlocks", { headers: { "User-Agent": "Mozilla/5.0 (delta-signal-scanner)" } }),
+  ]);
+  if (!deltaRes.ok) throw new Error(`Delta API ${deltaRes.status}`);
+  if (!pageRes.ok) throw new Error(`DefiLlama ${pageRes.status}`);
+  const deltaSyms = new Set<string>(
+    ((await deltaRes.json()).result ?? []).map((t: { underlying_asset_symbol?: string }) =>
+      String(t.underlying_asset_symbol ?? "").toUpperCase()),
+  );
+  let html: string | null = await pageRes.text();
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!m) throw new Error("DefiLlama page format badal gaya");
+  // deno-lint-ignore no-explicit-any
+  const items: any[] = JSON.parse(m[1])?.props?.pageProps?.data ?? [];
+  html = null;
+  if (!items.length) throw new Error("DefiLlama data khali");
+
+  const start = now.getTime() / 1000, end = start + 30 * 86400;
+  const rows = new Map<string, { symbol: string; unlock_date: string; pct_supply: number; note: string }>();
+  for (const p of items) {
+    const sym = String(p.tSymbol ?? "").toUpperCase();
+    if (!sym || UNLOCK_SKIP.has(sym) || !deltaSyms.has(sym) || !(p.circSupply > 0)) continue;
+    const byDay = new Map<string, number>();
+    for (const e of p.upcomingEvent ?? []) {
+      if (e.unlockType !== "cliff" || !(e.timestamp >= start && e.timestamp <= end)) continue;
+      const n = (e.noOfTokens ?? []).reduce((a: number, b: unknown) => a + num(b), 0);
+      const day = new Date(e.timestamp * 1000).toISOString().slice(0, 10);
+      byDay.set(day, (byDay.get(day) ?? 0) + n);
+    }
+    for (const [day, n] of byDay) {
+      const pctS = (n / p.circSupply) * 100;
+      if (pctS < 0.5) continue;
+      const usd = p.tPrice ? n * p.tPrice : 0;
+      const key = `${sym}|${day}`;
+      const prev = rows.get(key);
+      const total = (prev?.pct_supply ?? 0) + pctS;
+      rows.set(key, {
+        symbol: sym, unlock_date: day, pct_supply: Math.round(total * 100) / 100,
+        note: `${String(p.name ?? sym).slice(0, 60)}${usd ? ` · ~$${(usd / 1e6).toFixed(1)}M` : ""} · DefiLlama`,
+      });
+    }
+  }
+  // Sirf DefiLlama wali purani rows hatao; aapki khud ki daali rows waisi hi rahengi
+  await sb("delta_unlocks?note=like.*DefiLlama", { method: "DELETE", prefer: "return=minimal" });
+  const list = [...rows.values()];
+  if (list.length) {
+    await sb("delta_unlocks", { method: "POST", body: JSON.stringify(list), prefer: "return=minimal" });
+  }
+  return { unlocks: list.length };
+}
+
 Deno.serve(async (req) => {
   const now = new Date();
   const mode = new URL(req.url).searchParams.get("mode") ?? "scan";
   try {
     if (!SB_URL || !SB_KEY) throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing");
+    if (mode === "unlocks") {
+      // Din me ek-do baar kaafi hai; 1 ghante me ek se zyada nahi
+      const lastU = await getState("__UNLOCKS__");
+      if (lastU && now.getTime() - lastU.getTime() < 3_600_000) {
+        return Response.json({ ok: false, skipped: "unlocks recently refreshed" }, { status: 429 });
+      }
+      await upsertAlerts([{ symbol: "__UNLOCKS__", last_ts: now.toISOString(), last_score: 0 }]);
+      const res = await refreshUnlocks(now);
+      console.log(JSON.stringify(res));
+      return Response.json({ ok: true, mode, ...res });
+    }
     // Guard: 45 second me ek hi run (koi bahar se baar baar call kare to bhi)
     const last = await getState("__LASTRUN__");
     if (last && now.getTime() - last.getTime() < 45_000) {
