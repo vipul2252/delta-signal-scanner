@@ -8,7 +8,7 @@ export const SOXL = {
   MACD: [12, 26, 9] as const,
   STOCH: { rsi: 14, stoch: 14, k: 3, d: 3, upper: 80, lower: 20 },
   SWING_BARS: 10,          // SL: pichhli 10 candles (5m) ka swing high/low
-  RR: 2,                   // TP = 2 x risk
+  RR: 5,                   // TP = 5 x risk
   MIN_RISK_PCT: 0.15,      // isse chhota SL ho to skip (noise)
   MAX_RISK_PCT: 6,         // isse bada SL ho to skip
   MAX_TRADES_PER_DAY: 2,
