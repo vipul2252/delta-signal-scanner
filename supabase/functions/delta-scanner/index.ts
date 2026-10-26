@@ -7,7 +7,7 @@
 //   5. Roz ~8 AM IST summary
 // Sirf data/alert. Trade ka faisla user ka.
 
-import { SOXL, type Candle as SCandle, backtest as soxlBacktest, dailyTrendAt, entryAt, session, stochRsi } from "./soxl.ts";
+import { SOXL, type Candle as SCandle, aggregate, backtest as soxlBacktest, dailyTrendAt, entryAt, session, stochRsi } from "./soxl.ts";
 
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -429,7 +429,7 @@ async function weeklyReport(now: Date) {
   const be = (100 / (CFG.RR + 1)).toFixed(0);
   await tg([
     `📊 <b>Weekly Signal Report</b> · ${istDay(now)}`,
-    `<i>S = SOXLBUSD (Daily MACD trend + 5m Stoch RSI), SL swing par, TP 1:${SOXL.RR}, break-even ~${Math.round(100 / (SOXL.RR + 1))}% win. ` +
+    `<i>S = SOXLBUSD (Daily MACD trend + 10m Stoch RSI), SL swing par, TP 1:${SOXL.RR}, break-even ~${Math.round(100 / (SOXL.RR + 1))}% win. ` +
       `E/A/B/C = purane strategies (band, sirf purana hisaab; break-even ~${be}%).</i>`,
     `🗓 <b>Pichhle 7 din</b>\n${byVariant(week)}`,
     `📈 <b>Shuru se ab tak</b>\n${byVariant(all)}`,
@@ -471,20 +471,21 @@ async function runSoxl(now: Date) {
     await upsertAlerts([{ symbol: "__SOXLDAY__", last_ts: now.toISOString(), last_score: 0 }]);
     await tg(`🔔 <b>US market khula</b> · ${SOXL.SYMBOL}\n` +
       `Aaj ka daily MACD trend: <b>${trendTxt}</b> (MACD ${tr.line.toFixed(3)} vs Signal ${tr.signal.toFixed(3)})\n` +
-      `<i>${tr.trend === -1 ? "Sirf SELL dekhenge: 5m par upar jaane ke baad Stoch RSI 80 ke upar se cross down." :
-        tr.trend === 1 ? "Sirf BUY dekhenge: 5m par neeche aane ke baad Stoch RSI 20 ke neeche se cross up." : "Trend saaf nahi, aaj trade nahi."}</i>`);
+      `<i>${tr.trend === -1 ? "Sirf SELL dekhenge: 10m par upar jaane ke baad Stoch RSI 80 ke upar se cross down." :
+        tr.trend === 1 ? "Sirf BUY dekhenge: 10m par neeche aane ke baad Stoch RSI 20 ke neeche se cross up." : "Trend saaf nahi, aaj trade nahi."}</i>`);
   }
   if (tr.trend === 0) return { ...base, trend: 0 };
 
-  // Sirf nayi band 5m candle par check
-  const c5 = await deltaCandles(SOXL.SYMBOL, "5m", nowS - 400 * 300, nowS);
-  const closed = c5.filter((c) => c.time + 300 <= nowS);
-  if (closed.length < 60) return { ...base, trend: tr.trend, note: "5m data kam" };
+  // Sirf nayi band 10m candle par check (Delta ki 5m candles jod kar 10m banti hai)
+  const TF = SOXL.TF_SEC;
+  const c5 = await deltaCandles(SOXL.SYMBOL, "5m", nowS - 600 * 300, nowS);
+  const closed = aggregate(c5, TF).filter((c) => c.time + TF <= nowS);
+  if (closed.length < 60) return { ...base, trend: tr.trend, note: "10m data kam" };
   const lastC = closed[closed.length - 1];
-  const lastDone = await getState("__SOXL5M__");
+  const lastDone = await getState("__SOXL10M__");
   if (lastDone && lastDone.getTime() / 1000 >= lastC.time) return { ...base, trend: tr.trend, checked: false };
-  await upsertAlerts([{ symbol: "__SOXL5M__", last_ts: new Date(lastC.time * 1000).toISOString(), last_score: 0 }]);
-  if (session(lastC.time + 299).date !== ss.date || !session(lastC.time + 299).open) return { ...base, trend: tr.trend, checked: false };
+  await upsertAlerts([{ symbol: "__SOXL10M__", last_ts: new Date(lastC.time * 1000).toISOString(), last_score: 0 }]);
+  if (session(lastC.time + TF - 1).date !== ss.date || !session(lastC.time + TF - 1).open) return { ...base, trend: tr.trend, checked: false };
   if (ss.min > ss.closeMin - SOXL.NO_ENTRY_LAST_MIN) return { ...base, trend: tr.trend, note: "market band hone wala" };
 
   const { k, d } = stochRsi(closed.map((c) => c.close), SOXL.STOCH.rsi, SOXL.STOCH.stoch, SOXL.STOCH.k, SOXL.STOCH.d);
@@ -507,14 +508,14 @@ async function runSoxl(now: Date) {
   else {
     await sb("delta_trades", { method: "POST", prefer: "return=minimal", body: JSON.stringify({
       symbol: SOXL.SYMBOL, side: sig.side, entry: sig.entry, sl: sig.sl, tp: sig.tp, sl_pct: +sig.riskPct.toFixed(3),
-      score: 1, combo: "MACD-D+StochRSI-5m", btc_trend: tr.trend === 1 ? "up" : "down", variant: "S",
+      score: 1, combo: "MACD-D+StochRSI-10m", btc_trend: tr.trend === 1 ? "up" : "down", variant: "S",
     }) });
   }
   const buy = sig.side === "long";
   await tg([
     `${buy ? "🟢 <b>BUY</b>" : "🔴 <b>SELL</b>"} <b><a href="${link}">${SOXL.SYMBOL}</a></b> · ${istStr(now)}`,
     `Daily MACD trend: ${trendTxt}`,
-    `5m Stoch RSI: K ${kd.k} / D ${kd.d} — ${buy ? "20 ke neeche se upar cross" : "80 ke upar se neeche cross"}`,
+    `10m Stoch RSI: K ${kd.k} / D ${kd.d} — ${buy ? "20 ke neeche se upar cross" : "80 ke upar se neeche cross"}`,
     `Entry ~$${fmtPrice(sig.entry)}`,
     `SL $${fmtPrice(sig.sl)} (${sig.riskPct.toFixed(2)}%, ${buy ? "swing low" : "swing high"})`,
     `TP $${fmtPrice(sig.tp)} (${(sig.riskPct * SOXL.RR).toFixed(2)}%, 1:${SOXL.RR})`,
@@ -530,9 +531,10 @@ async function runSoxlBacktest(days: number) {
     deltaCandles(SOXL.SYMBOL, "5m", nowS - days * 86400, nowS),
     deltaCandles(SOXL.SYMBOL, "1d", nowS - (days + 120) * 86400, nowS),
   ]);
-  const bt = soxlBacktest(c5, daily);
+  const c10 = aggregate(c5, SOXL.TF_SEC);
+  const bt = soxlBacktest(c10, daily, SOXL.TF_SEC);
   return {
-    candles5m: c5.length, firstCandle: c5.length ? new Date(c5[0].time * 1000).toISOString() : null,
+    candles5m: c5.length, candles10m: c10.length, firstCandle: c5.length ? new Date(c5[0].time * 1000).toISOString() : null,
     dailyCandles: daily.length, skippedSignals: bt.skipped, summary: bt.summary,
     lastTrades: bt.trades.slice(-15).map((t) => ({ date: t.date, side: t.side, reason: t.reason, r: +t.r.toFixed(2), pnlPct: +t.pnlPct.toFixed(2) })),
   };

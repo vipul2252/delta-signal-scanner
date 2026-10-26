@@ -1,4 +1,4 @@
-// SOXLBUSD strategy: Daily MACD trend + 5m Stochastic RSI entry, sirf US market time me.
+// SOXLBUSD strategy: Daily MACD trend + 10m Stochastic RSI entry, sirf US market time me.
 // Pure functions (indicators, session, signal, backtest) — index.ts isse use karta hai.
 
 export type Candle = { time: number; open: number; high: number; low: number; close: number };
@@ -7,14 +7,35 @@ export const SOXL = {
   SYMBOL: "SOXLBUSD",
   MACD: [12, 26, 9] as const,
   STOCH: { rsi: 14, stoch: 14, k: 3, d: 3, upper: 80, lower: 20 },
-  SWING_BARS: 10,          // SL: pichhli 10 candles (5m) ka swing high/low
-  RR: 5,                   // TP = 5 x risk
+  TF_SEC: 600,             // entry timeframe: 10 minute (Delta 5m candles jod kar)
+  SWING_BARS: 10,          // SL: pichhli 10 candles (10m) ka swing high/low
+  RR: 3,                   // TP = 3 x risk
   MIN_RISK_PCT: 0.15,      // isse chhota SL ho to skip (noise)
   MAX_RISK_PCT: 6,         // isse bada SL ho to skip
   MAX_TRADES_PER_DAY: 2,
   NO_ENTRY_LAST_MIN: 15,   // market band hone se 15 min pehle naya trade nahi
   FEE_PCT: 0.1,            // round trip
 };
+
+// ---------------------------------------------------------------- 5m -> 10m (ya koi bhi TF) candles
+// Delta 10m resolution nahi deta, isliye 5m candles ko jodte hain. Sirf poori (dono 5m wali) candle rakhte hain.
+export function aggregate(c5: Candle[], tfSec = SOXL.TF_SEC): Candle[] {
+  const per = tfSec / 300;
+  const out: Candle[] = [];
+  let cur: Candle | null = null, n = 0;
+  for (const c of c5) {
+    const t = Math.floor(c.time / tfSec) * tfSec;
+    if (!cur || cur.time !== t) {
+      if (cur && n === per) out.push(cur);
+      cur = { time: t, open: c.open, high: c.high, low: c.low, close: c.close };
+      n = 1;
+    } else {
+      cur.high = Math.max(cur.high, c.high); cur.low = Math.min(cur.low, c.low); cur.close = c.close; n++;
+    }
+  }
+  if (cur && n === per) out.push(cur);
+  return out;
+}
 
 // ---------------------------------------------------------------- indicators
 export function ema(v: number[], len: number): number[] {
@@ -147,14 +168,15 @@ export type BtTrade = {
   exit: number; reason: "tp" | "sl" | "eod"; r: number; pnlPct: number; riskPct: number;
 };
 
-export function backtest(c5: Candle[], daily: Candle[]) {
+// c5 = entry timeframe ki candles (ab 10m, aggregate() se); step = ek candle ke seconds
+export function backtest(c5: Candle[], daily: Candle[], step = SOXL.TF_SEC) {
   const closes = c5.map((c) => c.close);
   const { k, d } = stochRsi(closes, SOXL.STOCH.rsi, SOXL.STOCH.stoch, SOXL.STOCH.k, SOXL.STOCH.d);
   const trades: BtTrade[] = [];
   const perDay = new Map<string, number>();
   let skipped = 0;
   for (let i = 30; i < c5.length - 1; i++) {
-    const closeT = c5[i].time + 300;                // signal candle band hone ka samay
+    const closeT = c5[i].time + step;               // signal candle band hone ka samay
     const s = session(closeT - 1);
     if (!s.open || s.min > s.closeMin - SOXL.NO_ENTRY_LAST_MIN) continue;
     if ((perDay.get(s.date) ?? 0) >= SOXL.MAX_TRADES_PER_DAY) continue;
