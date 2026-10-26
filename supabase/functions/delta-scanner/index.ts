@@ -7,6 +7,8 @@
 //   5. Roz ~8 AM IST summary
 // Sirf data/alert. Trade ka faisla user ka.
 
+import { SOXL, type Candle as SCandle, backtest as soxlBacktest, dailyTrendAt, entryAt, session, stochRsi } from "./soxl.ts";
+
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const TG_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -44,7 +46,7 @@ const CFG = {
   WEEKLY_DOW_IST: envNum("WEEKLY_DOW_IST", 0),   // 0 = Sunday
   WEEKLY_HOUR_IST: envNum("WEEKLY_HOUR_IST", 20),
   // EMA strategy (purane funding/OI signals ki jagah)
-  SIGNAL_MODE: Deno.env.get("SIGNAL_MODE") ?? "ema",   // "ema" ya "legacy"
+  SIGNAL_MODE: Deno.env.get("SIGNAL_MODE") ?? "soxl",  // "soxl" (abhi), "ema" ya "legacy"
   EMA_LEN: envNum("EMA_LEN", 200),
   EMA_TF_H: envNum("EMA_TF_H", 4),            // 4 ghante ki candles
   EMA_HOLD_H: envNum("EMA_HOLD_H", 168),      // 7 din me SL/TP na lage to band
@@ -277,7 +279,7 @@ async function tg(text: string) {
   }
 }
 
-const VARIANT_NAME: Record<string, string> = { A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
+const VARIANT_NAME: Record<string, string> = { S: "SOXLBUSD MACD+StochRSI", A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
 
 function alertBlock(cur: Ticker, sigs: Sig[], trades: PaperTrade[] = []) {
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
@@ -379,12 +381,17 @@ async function updateTrades(now: Date) {
     let status: string | null = null, exit = price;
     if (dir > 0 ? price <= t.sl : price >= t.sl) { status = "sl"; exit = t.sl; }
     else if (dir > 0 ? price >= t.tp : price <= t.tp) { status = "tp"; exit = t.tp; }
+    else if ((t.variant ?? "A") === "S") {
+      // SOXL trade: market band hone par (ya agle din) band
+      const ss = session(now.getTime() / 1000);
+      if (!ss.open || ss.date !== session(Date.parse(t.opened_at) / 1000).date) status = "eod";
+    }
     else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : CFG.HOLD_H)) status = "timeout";
     const patch: Record<string, unknown> = { max_fav_pct: fav, max_adv_pct: adv };
     if (status) {
       const r = (dir * pct(t.entry, exit) - CFG.FEE_PCT) / t.sl_pct;
       Object.assign(patch, { status, closed_at: now.toISOString(), exit_price: exit, r: Math.round(r * 100) / 100 });
-      const icon = status === "tp" ? "✅" : status === "sl" ? "❌" : "⏱";
+      const icon = status === "tp" ? "✅" : status === "sl" ? "❌" : status === "eod" ? "🔔" : "⏱";
       closedMsgs.push(`${icon} [${t.variant ?? "A"}] ${esc(t.symbol)} ${t.side.toUpperCase()} ${status.toUpperCase()} · ${r >= 0 ? "+" : ""}${r.toFixed(2)}R ` +
         `($${fmtPrice(t.entry)} → $${fmtPrice(exit)}, ${ageH.toFixed(1)}h)`);
     } else if (fav === num(t.max_fav_pct) && adv === num(t.max_adv_pct)) {
@@ -411,7 +418,7 @@ async function weeklyReport(now: Date) {
   const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=${cols}`) ?? [];
   const all: Closed[] = await sb(`delta_trades?status=neq.open&select=${cols}`) ?? [];
   const openN = (await sb("delta_trades?status=eq.open&select=id") ?? []).length;
-  const byVariant = (rows: Closed[]) => ["E", "A", "B", "C"].filter((v) => v === "E" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
+  const byVariant = (rows: Closed[]) => ["S", "E", "A", "B", "C"].filter((v) => v === "S" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
     const sub = rows.filter((x) => (x.variant ?? "A") === v);
     const sides = ["long", "short"].map((sd) => {
       const ss = sub.filter((x) => x.side === sd);
@@ -422,12 +429,113 @@ async function weeklyReport(now: Date) {
   const be = (100 / (CFG.RR + 1)).toFixed(0);
   await tg([
     `📊 <b>Weekly Signal Report</b> · ${istDay(now)}`,
-    `<i>E = EMA${CFG.EMA_LEN} cross (${CFG.EMA_TF_H}h) paper trades. A/B/C = purane signals (band ho chuke, sirf purana hisaab). ` +
-      `SL ${CFG.ATR_MULT}×ATR, TP ${CFG.RR}× SL, fees ${CFG.FEE_PCT}%. Break-even ~${be}% win.</i>`,
+    `<i>S = SOXLBUSD (Daily MACD trend + 5m Stoch RSI), SL swing par, TP 1:${SOXL.RR}, break-even ~${Math.round(100 / (SOXL.RR + 1))}% win. ` +
+      `E/A/B/C = purane strategies (band, sirf purana hisaab; break-even ~${be}%).</i>`,
     `🗓 <b>Pichhle 7 din</b>\n${byVariant(week)}`,
     `📈 <b>Shuru se ab tak</b>\n${byVariant(all)}`,
     `Abhi khule paper trades: ${openN}`,
   ].join("\n\n"));
+}
+
+// ---------------------------------------------------------------- SOXLBUSD strategy (live)
+async function deltaCandles(symbol: string, resolution: string, startSec: number, endSec: number): Promise<SCandle[]> {
+  const stepS = resolution === "5m" ? 300 : resolution === "1d" ? 86400 : resolution === "4h" ? 14400 : 3600;
+  const chunk = 1900 * stepS;
+  const out = new Map<number, SCandle>();
+  for (let s = startSec; s < endSec; s += chunk) {
+    const e = Math.min(endSec, s + chunk);
+    const r = await fetch(`https://api.india.delta.exchange/v2/history/candles?resolution=${resolution}&symbol=${
+      encodeURIComponent(symbol)}&start=${s}&end=${e}`);
+    if (!r.ok) throw new Error(`Delta candles ${resolution} ${r.status}`);
+    const j = await r.json();
+    for (const c of (j.result ?? []) as SCandle[]) out.set(c.time, { time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close });
+  }
+  return [...out.values()].sort((a, b) => a.time - b.time);
+}
+
+async function runSoxl(now: Date) {
+  await fetchTickers();                       // ALL_PRICES (paper trade tracking ke liye)
+  const tradeRes = await updateTrades(now);
+  const nowS = Math.floor(now.getTime() / 1000);
+  const ss = session(nowS);
+  const base = { mode: "soxl", market_open: ss.open, trades_open: tradeRes.open, trades_closed: tradeRes.closed };
+  if (!ss.open) return base;
+
+  const daily = await deltaCandles(SOXL.SYMBOL, "1d", nowS - 200 * 86400, nowS);
+  const tr = dailyTrendAt(daily, nowS);
+  const trendTxt = tr.trend === 1 ? "🟢 BUY" : tr.trend === -1 ? "🔴 SELL" : "⚪ Flat";
+
+  // Market khulte hi aaj ka trend batao (din me ek baar)
+  const lastDay = await getState("__SOXLDAY__");
+  if (!lastDay || session(lastDay.getTime() / 1000).date !== ss.date) {
+    await upsertAlerts([{ symbol: "__SOXLDAY__", last_ts: now.toISOString(), last_score: 0 }]);
+    await tg(`🔔 <b>US market khula</b> · ${SOXL.SYMBOL}\n` +
+      `Aaj ka daily MACD trend: <b>${trendTxt}</b> (MACD ${tr.line.toFixed(3)} vs Signal ${tr.signal.toFixed(3)})\n` +
+      `<i>${tr.trend === -1 ? "Sirf SELL dekhenge: 5m par upar jaane ke baad Stoch RSI 80 ke upar se cross down." :
+        tr.trend === 1 ? "Sirf BUY dekhenge: 5m par neeche aane ke baad Stoch RSI 20 ke neeche se cross up." : "Trend saaf nahi, aaj trade nahi."}</i>`);
+  }
+  if (tr.trend === 0) return { ...base, trend: 0 };
+
+  // Sirf nayi band 5m candle par check
+  const c5 = await deltaCandles(SOXL.SYMBOL, "5m", nowS - 400 * 300, nowS);
+  const closed = c5.filter((c) => c.time + 300 <= nowS);
+  if (closed.length < 60) return { ...base, trend: tr.trend, note: "5m data kam" };
+  const lastC = closed[closed.length - 1];
+  const lastDone = await getState("__SOXL5M__");
+  if (lastDone && lastDone.getTime() / 1000 >= lastC.time) return { ...base, trend: tr.trend, checked: false };
+  await upsertAlerts([{ symbol: "__SOXL5M__", last_ts: new Date(lastC.time * 1000).toISOString(), last_score: 0 }]);
+  if (session(lastC.time + 299).date !== ss.date || !session(lastC.time + 299).open) return { ...base, trend: tr.trend, checked: false };
+  if (ss.min > ss.closeMin - SOXL.NO_ENTRY_LAST_MIN) return { ...base, trend: tr.trend, note: "market band hone wala" };
+
+  const { k, d } = stochRsi(closed.map((c) => c.close), SOXL.STOCH.rsi, SOXL.STOCH.stoch, SOXL.STOCH.k, SOXL.STOCH.d);
+  const i = closed.length - 1;
+  const sig = entryAt(closed, k, d, i, tr.trend);
+  const kd = { k: +k[i].toFixed(1), d: +d[i].toFixed(1) };
+  if (!sig) return { ...base, trend: tr.trend, checked: true, ...kd };
+
+  // Aaj ke trades aur khula trade
+  type Row = { opened_at: string; status: string };
+  const recent: Row[] = await sb(`delta_trades?variant=eq.S&opened_at=gte.${new Date((nowS - 20 * 3600) * 1000).toISOString()}&select=opened_at,status`) ?? [];
+  const today = recent.filter((r) => session(Date.parse(r.opened_at) / 1000).date === ss.date);
+  const link = `https://www.delta.exchange/app/futures/trade/SOXLB/${SOXL.SYMBOL}`;
+  if (sig.skip) {
+    return { ...base, trend: tr.trend, signal: "skipped", riskPct: +sig.riskPct.toFixed(2) };
+  }
+  let note = "";
+  if (today.some((r) => r.status === "open")) note = "Ek trade pehle se khula hai — naya paper trade nahi khola.";
+  else if (today.length >= SOXL.MAX_TRADES_PER_DAY) note = `Aaj ke ${SOXL.MAX_TRADES_PER_DAY} trade ho chuke — naya paper trade nahi khola.`;
+  else {
+    await sb("delta_trades", { method: "POST", prefer: "return=minimal", body: JSON.stringify({
+      symbol: SOXL.SYMBOL, side: sig.side, entry: sig.entry, sl: sig.sl, tp: sig.tp, sl_pct: +sig.riskPct.toFixed(3),
+      score: 1, combo: "MACD-D+StochRSI-5m", btc_trend: tr.trend === 1 ? "up" : "down", variant: "S",
+    }) });
+  }
+  const buy = sig.side === "long";
+  await tg([
+    `${buy ? "🟢 <b>BUY</b>" : "🔴 <b>SELL</b>"} <b><a href="${link}">${SOXL.SYMBOL}</a></b> · ${istStr(now)}`,
+    `Daily MACD trend: ${trendTxt}`,
+    `5m Stoch RSI: K ${kd.k} / D ${kd.d} — ${buy ? "20 ke neeche se upar cross" : "80 ke upar se neeche cross"}`,
+    `Entry ~$${fmtPrice(sig.entry)}`,
+    `SL $${fmtPrice(sig.sl)} (${sig.riskPct.toFixed(2)}%, ${buy ? "swing low" : "swing high"})`,
+    `TP $${fmtPrice(sig.tp)} (${(sig.riskPct * SOXL.RR).toFixed(2)}%, 1:${SOXL.RR})`,
+    note ? `<i>${note}</i>` : `📘 Paper trade khul gaya (market band hone par apne aap band).`,
+    `<i>Sirf jaankari, financial advice nahi. SOXL 3x leveraged hai — size chhota rakhein, SL zaroor.</i>`,
+  ].join("\n"));
+  return { ...base, trend: tr.trend, signal: sig.side, ...kd };
+}
+
+async function runSoxlBacktest(days: number) {
+  const nowS = Math.floor(Date.now() / 1000);
+  const [c5, daily] = await Promise.all([
+    deltaCandles(SOXL.SYMBOL, "5m", nowS - days * 86400, nowS),
+    deltaCandles(SOXL.SYMBOL, "1d", nowS - (days + 120) * 86400, nowS),
+  ]);
+  const bt = soxlBacktest(c5, daily);
+  return {
+    candles5m: c5.length, firstCandle: c5.length ? new Date(c5[0].time * 1000).toISOString() : null,
+    dailyCandles: daily.length, skippedSignals: bt.skipped, summary: bt.summary,
+    lastTrades: bt.trades.slice(-15).map((t) => ({ date: t.date, side: t.side, reason: t.reason, r: +t.r.toFixed(2), pnlPct: +t.pnlPct.toFixed(2) })),
+  };
 }
 
 // ---------------------------------------------------------------- main
@@ -699,6 +807,15 @@ Deno.serve(async (req) => {
   const mode = new URL(req.url).searchParams.get("mode") ?? "scan";
   try {
     if (!SB_URL || !SB_KEY) throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing");
+    if (mode === "soxl_bt") {
+      const lastB = await getState("__SOXLBT__");
+      if (lastB && now.getTime() - lastB.getTime() < 60_000) {
+        return Response.json({ ok: false, skipped: "1 minute me ek backtest" }, { status: 429 });
+      }
+      await upsertAlerts([{ symbol: "__SOXLBT__", last_ts: now.toISOString(), last_score: 0 }]);
+      const days = Math.min(400, Math.max(5, Number(new URL(req.url).searchParams.get("days") ?? 180)));
+      return Response.json({ ok: true, mode, days, ...(await runSoxlBacktest(days)) });
+    }
     if (mode === "unlocks") {
       // Din me ek-do baar kaafi hai; 1 ghante me ek se zyada nahi
       const lastU = await getState("__UNLOCKS__");
@@ -722,11 +839,12 @@ Deno.serve(async (req) => {
       return Response.json({ ok: true, mode });
     }
     const emaMode = CFG.SIGNAL_MODE === "ema";
-    const result: Record<string, unknown> = emaMode ? await runEmaScan(now) : await runScan(now);
+    const soxlMode = CFG.SIGNAL_MODE === "soxl";
+    const result: Record<string, unknown> = soxlMode ? await runSoxl(now) : emaMode ? await runEmaScan(now) : await runScan(now);
 
     // Roz ek baar summary (8 AM IST ke baad pehla run)
     const ist = istDate(now);
-    if (mode === "summary" || ist.getUTCHours() >= CFG.SUMMARY_HOUR_IST) {
+    if (!soxlMode && (mode === "summary" || ist.getUTCHours() >= CFG.SUMMARY_HOUR_IST)) {
       const lastSum = await getState("__SUMMARY__");
       if (mode === "summary" || !lastSum || istDay(lastSum) !== istDay(now)) {
         if (emaMode) await runEmaSummary(now); else await runSummary(now);
