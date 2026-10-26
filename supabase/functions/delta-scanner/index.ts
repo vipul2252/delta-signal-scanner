@@ -7,6 +7,7 @@
 //   5. Roz ~8 AM IST summary
 // Sirf data/alert. Trade ka faisla user ka.
 
+import { fetchAllFunding, fundingFor } from "./xfunding.ts";
 import { SOXL, type Candle as SCandle, aggregate, backtest as soxlBacktest, dailyTrendAt, entryAt, session, stochRsi } from "./soxl.ts";
 
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
@@ -51,7 +52,9 @@ const CFG = {
   EMA_TF_H: envNum("EMA_TF_H", 4),            // 4 ghante ki candles
   EMA_HOLD_H: envNum("EMA_HOLD_H", 168),      // 7 din me SL/TP na lage to band
   // Funding-high short (chhote coins): funding (8h, %) is se upar -> SHORT, SL +X%, N ghante baad band
-  FUND_SHORT_TH: envNum("FUND_SHORT_TH", 0.2),
+  FUND_SHORT_TH: envNum("FUND_SHORT_TH", 0.2),     // sirf Delta par high (weak / delta-only)
+  FUND_PRE_TH: envNum("FUND_PRE_TH", 0.1),         // Delta par kam se kam itna (strong ke liye)
+  FUND_X_TH: envNum("FUND_X_TH", 0.1),             // doosre exchange par itna -> strong
   FUND_SHORT_SL: envNum("FUND_SHORT_SL", 25),
   FUND_SHORT_HOLD_H: envNum("FUND_SHORT_HOLD_H", 72),
   FUND_SHORT_ON: (Deno.env.get("FUND_SHORT_ON") ?? "1") !== "0",
@@ -288,7 +291,7 @@ async function tg(text: string) {
   }
 }
 
-const VARIANT_NAME: Record<string, string> = { F: "Funding-high short (chhote coins)", S: "SOXLBUSD MACD+StochRSI", A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
+const VARIANT_NAME: Record<string, string> = { F: "Funding-high short (strong / delta-only)", G: "Funding-high short (kamzor: sirf Delta)", S: "SOXLBUSD MACD+StochRSI", A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
 
 function alertBlock(cur: Ticker, sigs: Sig[], trades: PaperTrade[] = []) {
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
@@ -395,7 +398,7 @@ async function updateTrades(now: Date) {
       const ss = session(now.getTime() / 1000);
       if (!ss.open || ss.date !== session(Date.parse(t.opened_at) / 1000).date) status = "eod";
     }
-    else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : (t.variant ?? "A") === "F" ? CFG.FUND_SHORT_HOLD_H : CFG.HOLD_H)) status = "timeout";
+    else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : ["F", "G"].includes(t.variant ?? "A") ? CFG.FUND_SHORT_HOLD_H : CFG.HOLD_H)) status = "timeout";
     const patch: Record<string, unknown> = { max_fav_pct: fav, max_adv_pct: adv };
     if (status) {
       const r = (dir * pct(t.entry, exit) - CFG.FEE_PCT) / t.sl_pct;
@@ -427,7 +430,7 @@ async function weeklyReport(now: Date) {
   const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=${cols}`) ?? [];
   const all: Closed[] = await sb(`delta_trades?status=neq.open&select=${cols}`) ?? [];
   const openN = (await sb("delta_trades?status=eq.open&select=id") ?? []).length;
-  const byVariant = (rows: Closed[]) => ["S", "F", "E", "A", "B", "C"].filter((v) => v === "S" || v === "F" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
+  const byVariant = (rows: Closed[]) => ["S", "F", "G", "E", "A", "B", "C"].filter((v) => v === "S" || v === "F" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
     const sub = rows.filter((x) => (x.variant ?? "A") === v);
     const sides = ["long", "short"].map((sd) => {
       const ss = sub.filter((x) => x.side === sd);
@@ -557,39 +560,67 @@ const MAJORS = new Set(["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "DOGEU
   "LINKUSD", "DOTUSD", "AVAXUSD", "UNIUSD", "AAVEUSD", "TRXUSD", "TONUSD", "SUIUSD", "HYPEUSD", "NEARUSD", "ATOMUSD",
   "XLMUSD", "ETCUSD", "FILUSD", "ARBUSD", "OPUSD", "APTUSD"]);
 
+// Grade: STRONG = Delta > FUND_PRE_TH aur kam se kam ek doosre exchange par > FUND_X_TH  (variant F)
+//        DELTA-ONLY = coin sirf Delta par (doosre exchange par nahi), Delta > FUND_SHORT_TH (variant F)
+//        WEAK = Delta > FUND_SHORT_TH lekin doosre exchanges par funding normal          (variant G, alag hisaab)
+//        Sirf doosre exchange par high (Delta normal) -> koi signal nahi (backtest me nuksaan)
 async function runFundingShort(now: Date) {
   if (!CFG.FUND_SHORT_ON) return { fund_short: "off" };
   const tickers = LAST_TICKERS.length ? LAST_TICKERS : await fetchTickers();
-  const cands = tickers.filter((t) => !t.tradfi && !MAJORS.has(t.symbol) && t.mark_price > 0 && t.funding_rate > CFG.FUND_SHORT_TH);
+  const cands = tickers.filter((t) => !t.tradfi && !MAJORS.has(t.symbol) && t.mark_price > 0 && t.funding_rate > CFG.FUND_PRE_TH);
   if (!cands.length) return { fund_short: 0 };
-  // Pichhle 3 din me isi coin par F trade khula tha to dobara nahi (fresh spike hi chahiye)
+  // Pichhle 3 din me isi coin par F/G trade khula tha to dobara nahi (fresh spike hi chahiye)
   const since = new Date(now.getTime() - 3 * 86_400_000).toISOString();
   type Row = { symbol: string };
-  const recent: Row[] = await sb(`delta_trades?variant=eq.F&opened_at=gte.${since}&select=symbol`) ?? [];
-  const open: Row[] = await sb(`delta_trades?variant=eq.F&status=eq.open&select=symbol`) ?? [];
+  const recent: Row[] = await sb(`delta_trades?variant=in.(F,G)&opened_at=gte.${since}&select=symbol`) ?? [];
+  const open: Row[] = await sb(`delta_trades?variant=in.(F,G)&status=eq.open&select=symbol`) ?? [];
   const skip = new Set([...recent, ...open].map((r) => r.symbol));
   const fresh = cands.filter((t) => !skip.has(t.symbol));
   if (!fresh.length) return { fund_short: 0, already: cands.length };
-  const rows = fresh.map((t) => ({
+
+  const { all, status } = await fetchAllFunding();
+  type Pick = { t: Ticker; grade: "strong" | "delta-only" | "weak"; others: Record<string, number> };
+  const picks: Pick[] = [];
+  for (const t of fresh) {
+    const others = fundingFor(all, t.underlying);
+    const vals = Object.values(others);
+    const nHigh = vals.filter((v) => v > CFG.FUND_X_TH).length;
+    if (nHigh >= 1) picks.push({ t, grade: "strong", others });
+    else if (t.funding_rate > CFG.FUND_SHORT_TH) picks.push({ t, grade: vals.length ? "weak" : "delta-only", others });
+  }
+  if (!picks.length) return { fund_short: 0, checked: fresh.length, xstatus: status };
+
+  const rows = picks.map(({ t, grade }) => ({
     symbol: t.symbol, side: "short", entry: t.mark_price,
     sl: t.mark_price * (1 + CFG.FUND_SHORT_SL / 100), tp: 0, sl_pct: CFG.FUND_SHORT_SL,
-    score: 1, combo: `FUND>${CFG.FUND_SHORT_TH}`, btc_trend: null, variant: "F",
+    score: grade === "strong" ? 2 : 1, combo: `FUND ${grade}`, btc_trend: null, variant: grade === "weak" ? "G" : "F",
   }));
   await sb("delta_trades", { method: "POST", body: JSON.stringify(rows), prefer: "return=minimal" });
   const end = new Date(now.getTime() + CFG.FUND_SHORT_HOLD_H * 3_600_000);
-  const blocks = fresh.map((t) => {
+  const label = { strong: "💪 STRONG (Delta + doosre exchange dono par funding high)", "delta-only": "Sirf Delta par listed coin", weak: "⚠️ KAMZOR (sirf Delta par high, baaki exchange normal)" };
+  const blocks = picks.map(({ t, grade, others }) => {
     const link = `https://www.delta.exchange/app/futures/trade/${t.underlying}/${t.symbol}`;
+    const ex = Object.entries(others).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v >= 0 ? "+" : ""}${v.toFixed(3)}%`).join(" · ");
     return [
-      `🔴 <b>SELL <a href="${link}">${esc(t.symbol)}</a></b> — funding <b>+${t.funding_rate.toFixed(3)}%</b> / 8h (longs bahut bhaari)`,
+      `🔴 <b>SELL <a href="${link}">${esc(t.symbol)}</a></b> — ${label[grade]}`,
+      `Funding /8h: <b>Delta +${t.funding_rate.toFixed(3)}%</b>${ex ? " · " + ex : " · (doosre exchange par listed nahi)"}`,
       `Entry ~$${fmtPrice(t.mark_price)} · SL $${fmtPrice(t.mark_price * (1 + CFG.FUND_SHORT_SL / 100))} (+${CFG.FUND_SHORT_SL}%) · ` +
         `${CFG.FUND_SHORT_HOLD_H}h baad exit (~${istStr(end)})`,
       `24h ${sign(t.change_24h)}% · OI ${fmtUsd(t.oi_usd)} · Vol ${fmtUsd(t.volume_usd)}`,
     ].join("\n");
   });
   await tg(`📉 <b>Funding-high SHORT</b> · ${istStr(now)}\n\n` + blocks.join("\n\n") +
-    `\n\n<i>Backtest: funding &gt; ${CFG.FUND_SHORT_TH}% ke baad 3 din me chhote coins aksar gire (68% baar), lekin kabhi-kabhi aur upar bhi bhaage. ` +
-    `Paper trade khul gaya. Chhote coin — size bahut chhota rakhein, SL zaroor. Financial advice nahi.</i>`);
-  return { fund_short: fresh.length };
+    `\n\n<i>Backtest (chhote coins, 3 din): Delta + doosre exchange dono par funding high → ~70% baar gire. ` +
+    `Sirf Delta par high → kamzor. Kabhi-kabhi coin aur upar bhi bhaagta hai. Paper trade khul gaya. Size bahut chhota, SL zaroor. Financial advice nahi.</i>`);
+  return { fund_short: picks.length, grades: picks.map((p) => `${p.t.symbol}:${p.grade}`).join(","), xstatus: status };
+}
+
+// Debug: Supabase se kaun se exchange chal rahe hain
+async function xfundStatus() {
+  const { all, status } = await fetchAllFunding(0);
+  const sample: Record<string, unknown> = {};
+  for (const c of ["BTC", "ETH", "LAB", "BEAT", "AR"]) sample[c] = fundingFor(all, c);
+  return { status, sample };
 }
 
 // ---------------------------------------------------------------- main
@@ -869,6 +900,9 @@ Deno.serve(async (req) => {
       await upsertAlerts([{ symbol: "__SOXLBT__", last_ts: now.toISOString(), last_score: 0 }]);
       const days = Math.min(400, Math.max(5, Number(new URL(req.url).searchParams.get("days") ?? 180)));
       return Response.json({ ok: true, mode, days, ...(await runSoxlBacktest(days)) });
+    }
+    if (mode === "xfund") {
+      return Response.json({ ok: true, mode, ...(await xfundStatus()) });
     }
     if (mode === "unlocks") {
       // Din me ek-do baar kaafi hai; 1 ghante me ek se zyada nahi
