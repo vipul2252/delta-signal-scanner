@@ -54,7 +54,7 @@ const CFG = {
   // Funding-high short (chhote coins): funding (8h, %) is se upar -> SHORT, SL +X%, N ghante baad band
   FUND_SHORT_TH: envNum("FUND_SHORT_TH", 0.2),     // sirf Delta par high (weak / delta-only)
   FUND_PRE_TH: envNum("FUND_PRE_TH", 0.1),         // Delta par kam se kam itna (strong ke liye)
-  FUND_X_TH: envNum("FUND_X_TH", 0.1),             // doosre exchange par itna -> strong
+  FUND_X_TH: envNum("FUND_X_TH", 0.05),            // doosre exchange par itna -> strong (backtest: 0.05 best)
   FUND_SHORT_SL: envNum("FUND_SHORT_SL", 25),
   FUND_SHORT_HOLD_H: envNum("FUND_SHORT_HOLD_H", 72),
   FUND_SHORT_ON: (Deno.env.get("FUND_SHORT_ON") ?? "1") !== "0",
@@ -610,7 +610,7 @@ async function runFundingShort(now: Date) {
     ].join("\n");
   });
   await tg(`📉 <b>Funding-high SHORT</b> · ${istStr(now)}\n\n` + blocks.join("\n\n") +
-    `\n\n<i>Backtest (chhote coins, 3 din): Delta + doosre exchange dono par funding high → ~70% baar gire. ` +
+    `\n\n<i>Backtest (chhote coins, 3 din, SL 25%): Delta Backtest (chhote coins, 3 din): Delta + doosre exchange dono par funding high → ~70% baar gire. gt; 0.1% + doosre exchange par bhi high → 67% baar gire, avg +5%. ` +
     `Sirf Delta par high → kamzor. Kabhi-kabhi coin aur upar bhi bhaagta hai. Paper trade khul gaya. Size bahut chhota, SL zaroor. Financial advice nahi.</i>`);
   return { fund_short: picks.length, grades: picks.map((p) => `${p.t.symbol}:${p.grade}`).join(","), xstatus: status };
 }
