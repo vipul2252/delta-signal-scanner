@@ -50,6 +50,11 @@ const CFG = {
   EMA_LEN: envNum("EMA_LEN", 200),
   EMA_TF_H: envNum("EMA_TF_H", 4),            // 4 ghante ki candles
   EMA_HOLD_H: envNum("EMA_HOLD_H", 168),      // 7 din me SL/TP na lage to band
+  // Funding-high short (chhote coins): funding (8h, %) is se upar -> SHORT, SL +X%, N ghante baad band
+  FUND_SHORT_TH: envNum("FUND_SHORT_TH", 0.2),
+  FUND_SHORT_SL: envNum("FUND_SHORT_SL", 25),
+  FUND_SHORT_HOLD_H: envNum("FUND_SHORT_HOLD_H", 72),
+  FUND_SHORT_ON: (Deno.env.get("FUND_SHORT_ON") ?? "1") !== "0",
   EXCLUDE: new Set((Deno.env.get("EXCLUDE_SYMBOLS") ?? "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)),
 };
 const LEVERAGES = [10, 20, 25, 50];
@@ -59,6 +64,7 @@ const IST_OFFSET_MS = 5.5 * 3600 * 1000;
 type Ticker = {
   symbol: string; underlying: string; mark_price: number; funding_rate: number;
   oi_usd: number; oi_change_6h_usd: number; volume_usd: number; change_24h: number;
+  tradfi?: boolean;
 };
 type Stats = {
   symbol: string; f_mean: number | null; f_sd: number | null; f_n: number;
@@ -147,10 +153,13 @@ async function fetchTickers(): Promise<Ticker[]> {
       oi_change_6h_usd: num(t.oi_change_usd_6h),
       volume_usd: vol,
       change_24h: num(t.mark_change_24h ?? t.ltp_change_24h),
+      tradfi: (t.tags ?? []).includes("xStock") || t.top_tag === "tradfi" || /XAU|XAG|PAXG/.test(sym),
     });
   }
+  LAST_TICKERS = out;
   return out;
 }
+let LAST_TICKERS: Ticker[] = [];
 
 // ---------------------------------------------------------------- signals
 function sigFunding(cur: Ticker, st?: Stats): Sig | null {
@@ -279,7 +288,7 @@ async function tg(text: string) {
   }
 }
 
-const VARIANT_NAME: Record<string, string> = { S: "SOXLBUSD MACD+StochRSI", A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
+const VARIANT_NAME: Record<string, string> = { F: "Funding-high short (chhote coins)", S: "SOXLBUSD MACD+StochRSI", A: "Signal disha", B: "Ulta", C: "BTC trend disha", E: "EMA200 cross" };
 
 function alertBlock(cur: Ticker, sigs: Sig[], trades: PaperTrade[] = []) {
   const bias = sigs.reduce((a, s) => a + s.bias, 0);
@@ -386,7 +395,7 @@ async function updateTrades(now: Date) {
       const ss = session(now.getTime() / 1000);
       if (!ss.open || ss.date !== session(Date.parse(t.opened_at) / 1000).date) status = "eod";
     }
-    else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : CFG.HOLD_H)) status = "timeout";
+    else if (ageH >= ((t.variant ?? "A") === "E" ? CFG.EMA_HOLD_H : (t.variant ?? "A") === "F" ? CFG.FUND_SHORT_HOLD_H : CFG.HOLD_H)) status = "timeout";
     const patch: Record<string, unknown> = { max_fav_pct: fav, max_adv_pct: adv };
     if (status) {
       const r = (dir * pct(t.entry, exit) - CFG.FEE_PCT) / t.sl_pct;
@@ -418,7 +427,7 @@ async function weeklyReport(now: Date) {
   const week: Closed[] = await sb(`delta_trades?status=neq.open&closed_at=gte.${since}&select=${cols}`) ?? [];
   const all: Closed[] = await sb(`delta_trades?status=neq.open&select=${cols}`) ?? [];
   const openN = (await sb("delta_trades?status=eq.open&select=id") ?? []).length;
-  const byVariant = (rows: Closed[]) => ["S", "E", "A", "B", "C"].filter((v) => v === "S" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
+  const byVariant = (rows: Closed[]) => ["S", "F", "E", "A", "B", "C"].filter((v) => v === "S" || v === "F" || rows.some((x) => (x.variant ?? "A") === v)).map((v) => {
     const sub = rows.filter((x) => (x.variant ?? "A") === v);
     const sides = ["long", "short"].map((sd) => {
       const ss = sub.filter((x) => x.side === sd);
@@ -430,6 +439,7 @@ async function weeklyReport(now: Date) {
   await tg([
     `📊 <b>Weekly Signal Report</b> · ${istDay(now)}`,
     `<i>S = SOXLBUSD (Daily MACD trend + 10m Stoch RSI), SL swing par, TP 1:${SOXL.RR}, break-even ~${Math.round(100 / (SOXL.RR + 1))}% win. ` +
+      `F = chhote coins par funding > ${CFG.FUND_SHORT_TH}%/8h hone par SHORT, SL +${CFG.FUND_SHORT_SL}%, ${CFG.FUND_SHORT_HOLD_H}h baad band (R = SL ke hisaab se). ` +
       `E/A/B/C = purane strategies (band, sirf purana hisaab; break-even ~${be}%).</i>`,
     `🗓 <b>Pichhle 7 din</b>\n${byVariant(week)}`,
     `📈 <b>Shuru se ab tak</b>\n${byVariant(all)}`,
@@ -538,6 +548,48 @@ async function runSoxlBacktest(days: number) {
     dailyCandles: daily.length, skippedSignals: bt.skipped, summary: bt.summary,
     lastTrades: bt.trades.slice(-15).map((t) => ({ date: t.date, side: t.side, reason: t.reason, r: +t.r.toFixed(2), pnlPct: +t.pnlPct.toFixed(2) })),
   };
+}
+
+// ---------------------------------------------------------------- Funding-high SHORT (chhote coins, 24x7)
+// Backtest (Delta, 155 chhote coins, ~2.5 saal): funding > 0.2%/8h ke turant baad short, 3 din hold ->
+// 81 trades, 68% win, avg +7% (fees+funding ke baad); SL +25% ke saath avg +4%. Sirf jaankari / paper trade.
+const MAJORS = new Set(["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "DOGEUSD", "ADAUSD", "LTCUSD", "BCHUSD",
+  "LINKUSD", "DOTUSD", "AVAXUSD", "UNIUSD", "AAVEUSD", "TRXUSD", "TONUSD", "SUIUSD", "HYPEUSD", "NEARUSD", "ATOMUSD",
+  "XLMUSD", "ETCUSD", "FILUSD", "ARBUSD", "OPUSD", "APTUSD"]);
+
+async function runFundingShort(now: Date) {
+  if (!CFG.FUND_SHORT_ON) return { fund_short: "off" };
+  const tickers = LAST_TICKERS.length ? LAST_TICKERS : await fetchTickers();
+  const cands = tickers.filter((t) => !t.tradfi && !MAJORS.has(t.symbol) && t.mark_price > 0 && t.funding_rate > CFG.FUND_SHORT_TH);
+  if (!cands.length) return { fund_short: 0 };
+  // Pichhle 3 din me isi coin par F trade khula tha to dobara nahi (fresh spike hi chahiye)
+  const since = new Date(now.getTime() - 3 * 86_400_000).toISOString();
+  type Row = { symbol: string };
+  const recent: Row[] = await sb(`delta_trades?variant=eq.F&opened_at=gte.${since}&select=symbol`) ?? [];
+  const open: Row[] = await sb(`delta_trades?variant=eq.F&status=eq.open&select=symbol`) ?? [];
+  const skip = new Set([...recent, ...open].map((r) => r.symbol));
+  const fresh = cands.filter((t) => !skip.has(t.symbol));
+  if (!fresh.length) return { fund_short: 0, already: cands.length };
+  const rows = fresh.map((t) => ({
+    symbol: t.symbol, side: "short", entry: t.mark_price,
+    sl: t.mark_price * (1 + CFG.FUND_SHORT_SL / 100), tp: 0, sl_pct: CFG.FUND_SHORT_SL,
+    score: 1, combo: `FUND>${CFG.FUND_SHORT_TH}`, btc_trend: null, variant: "F",
+  }));
+  await sb("delta_trades", { method: "POST", body: JSON.stringify(rows), prefer: "return=minimal" });
+  const end = new Date(now.getTime() + CFG.FUND_SHORT_HOLD_H * 3_600_000);
+  const blocks = fresh.map((t) => {
+    const link = `https://www.delta.exchange/app/futures/trade/${t.underlying}/${t.symbol}`;
+    return [
+      `🔴 <b>SELL <a href="${link}">${esc(t.symbol)}</a></b> — funding <b>+${t.funding_rate.toFixed(3)}%</b> / 8h (longs bahut bhaari)`,
+      `Entry ~$${fmtPrice(t.mark_price)} · SL $${fmtPrice(t.mark_price * (1 + CFG.FUND_SHORT_SL / 100))} (+${CFG.FUND_SHORT_SL}%) · ` +
+        `${CFG.FUND_SHORT_HOLD_H}h baad exit (~${istStr(end)})`,
+      `24h ${sign(t.change_24h)}% · OI ${fmtUsd(t.oi_usd)} · Vol ${fmtUsd(t.volume_usd)}`,
+    ].join("\n");
+  });
+  await tg(`📉 <b>Funding-high SHORT</b> · ${istStr(now)}\n\n` + blocks.join("\n\n") +
+    `\n\n<i>Backtest: funding &gt; ${CFG.FUND_SHORT_TH}% ke baad 3 din me chhote coins aksar gire (68% baar), lekin kabhi-kabhi aur upar bhi bhaage. ` +
+    `Paper trade khul gaya. Chhote coin — size bahut chhota rakhein, SL zaroor. Financial advice nahi.</i>`);
+  return { fund_short: fresh.length };
 }
 
 // ---------------------------------------------------------------- main
@@ -843,6 +895,9 @@ Deno.serve(async (req) => {
     const emaMode = CFG.SIGNAL_MODE === "ema";
     const soxlMode = CFG.SIGNAL_MODE === "soxl";
     const result: Record<string, unknown> = soxlMode ? await runSoxl(now) : emaMode ? await runEmaScan(now) : await runScan(now);
+    // Chhote coins par funding-high short (24x7, har mode ke saath)
+    try { Object.assign(result, await runFundingShort(now)); }
+    catch (e) { console.error("fundShort", e); result.fund_short_error = String(e).slice(0, 200); }
 
     // Roz ek baar summary (8 AM IST ke baad pehla run)
     const ist = istDate(now);
